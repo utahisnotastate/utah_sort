@@ -1,0 +1,6 @@
+target/
+target-novec/
+__pycache__/
+
+# Local, unpublished notes
+notes/
