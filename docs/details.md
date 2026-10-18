@@ -103,8 +103,12 @@ every gap is the same data-dependent loop that slows Shellsort down.
 
 ## Timing
 
-From [`results/ryzen-9-9950x3d/main.md`](../results/ryzen-9-9950x3d/main.md),
-in ms. "Branch-free" means the compare-exchange is written as min/max.
+From [`results/ryzen-9-9950x3d/main.md`](../results/ryzen-9-9950x3d/main.md)
+(commit `d420208`), in ms. "Branch-free" means the compare-exchange is written
+as min/max. The current code runs the branch-free rows about 10% slower on
+`u32` because of code layout (27 ms at 1M, in
+[`main-u32.md`](../results/ryzen-9-9950x3d/main-u32.md)); see
+[Other key types](#other-key-types).
 
 | Input, n | Shellsort | shaker 1987 | shaker 1987, branch-free | Utah | Utah, branch-free | `sort_unstable` |
 |---|---:|---:|---:|---:|---:|---:|
@@ -123,8 +127,10 @@ gives the same picture. Branch-free shaker sort takes 24 ms at 1M in both.
 Three things stand out:
 
 1. **The branch is the whole difference.** With branches, shaker sort ties
-   Shellsort on random input (82 vs 82 ms). Branch-free, it is 3.4× faster.
-2. **Branch-free shaker sort takes about 24 ms on every 1M input.** It does
+   Shellsort on random input (82 vs 82 ms). Branch-free, it is 3.4× faster in
+   this build and 3.1× in the current one.
+2. **Branch-free shaker sort takes about the same time on every 1M input**
+   (24 ms here, 26–27 ms in the current build). It does
    the same work regardless of the data. That makes it fast where branches
    would be unpredictable (random, nearly sorted) and slow where they would be
    predictable (sorted, few unique values).

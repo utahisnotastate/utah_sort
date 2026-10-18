@@ -2,7 +2,7 @@
 
 In 1987, a Shellsort variant called **shaker sort** ran about 15% slower than
 a well-tuned Shellsort on a VAX 11/780. Written branch-free and run on a
-current CPU, the same algorithm is **3.4× faster** than Shellsort.
+current CPU, the same algorithm is **about 3× faster** than Shellsort.
 
 ![Running time relative to Shellsort: 1987 on a VAX vs. today on a Ryzen 9 9950X3D](docs/benchmarks.png)
 
@@ -21,12 +21,15 @@ Sorting 1,000,000 random `u32` keys on one core of an AMD Ryzen 9 9950X3D
 
 | Algorithm | Time |
 |---|---:|
-| Shellsort, Ciura gaps | 82 ms |
-| Shaker sort (1987), compare-exchange with a branch | 82 ms |
-| **Shaker sort (1987), branch-free compare-exchange** | **24 ms** |
-| Rust `slice::sort_unstable`, for reference | 7.9 ms |
+| Shellsort, Ciura gaps | 81 ms |
+| Shaker sort (1987), compare-exchange with a branch | 81 ms |
+| **Shaker sort (1987), branch-free compare-exchange** | **27 ms** |
+| Rust `slice::sort_unstable`, for reference | 9.4 ms |
 
-At 10,000,000 keys: 1,011 ms, 973 ms, **288 ms** and 91 ms.
+At 10,000,000 keys: 1,005 ms, 984 ms, **318 ms** and 109 ms. These come from
+[`main-u32.md`](results/ryzen-9-9950x3d/main-u32.md), the current code. An
+earlier build measured 24 ms (3.4×) for the branch-free row; that turned out
+to be a lucky code layout ([details](#other-key-types)).
 
 The second and third rows are the same algorithm with the same gaps. The only
 difference is how one compare-exchange is written:
@@ -45,9 +48,9 @@ For comparison, the 1987 paper (Table 5) reports 37.9 s for shaker sort and
 32.4 s for Shellsort at n = 75,000 on a VAX 11/780.
 
 All inputs and sizes are in [`results/`](results/ryzen-9-9950x3d/). Shaker
-sort is not faster everywhere. On already-sorted input, Shellsort takes 8 ms and branch-free
-shaker sort takes 24 ms, because shaker sort does the same work no matter what
-the input looks like.
+sort is not faster everywhere. On already-sorted input, Shellsort takes 6 ms
+and branch-free shaker sort takes 26 ms, because shaker sort does the same
+work no matter what the input looks like.
 
 ## Why, probably
 
@@ -70,9 +73,9 @@ each one is a conditional move with nothing to mispredict.
 
 **It isn't SIMD.** With `target-cpu=native`, LLVM auto-vectorizes the
 branch-free passes with AVX-512. With vectorization turned off
-(`-C no-vectorize-loops -C no-vectorize-slp`), the assembly is scalar `cmov`
-and shaker sort still takes 24 ms at 1M and 292 ms at 10M. That's the same
-as with SIMD to within noise, and still 3.5× faster than Shellsort. See
+(`-C no-vectorize-loops -C no-vectorize-slp`), the assembly is scalar `cmov`.
+In that comparison (commit `d420208`), shaker sort took 24 ms at 1M both with
+and without SIMD, so vectorization isn't what makes it fast. See
 [`main-no-simd.md`](results/ryzen-9-9950x3d/main-no-simd.md).
 
 **Not yet confirmed.** I haven't measured branch mispredictions with hardware
@@ -113,12 +116,12 @@ patterns. 1M random keys, all from one build:
   branch (12.6 s vs 10.4 s), probably because the branch lets the CPU start
   the next loads before the comparison finishes.
 
-The `u32` row is slower than the headline (27 vs 24 ms), although the inner
-loop compiles to the same instructions. The headline numbers come from the
-previous commit (`d420208`). With loops forced to 64-byte alignment, that
-build and the current one both take 26.4 ms, so 24 ms was a lucky code
-layout. Building the current code gives about 3.1× for `u32`, not 3.4×. More
-in [`docs/details.md`](docs/details.md#other-key-types).
+The first published numbers (commit `d420208`) had 24 ms for branch-free
+shaker sort on `u32`, which is 3.4×. The inner loop compiles to the same
+instructions in that build and the current one. With loops forced to 64-byte
+alignment, both take 26.4 ms, so 24 ms was a lucky code layout. The headline
+table now uses the current build. More in
+[`docs/details.md`](docs/details.md#other-key-types).
 
 ## What about Utah Sort?
 
@@ -136,7 +139,7 @@ Its three additions:
 All three are correct. The proofs are in [`docs/details.md`](docs/details.md),
 and `python/check_correctness.py` checks them on 695,129 inputs using a list
 that refuses negative indices. They don't make it faster on random data
-(branch-free, 1M keys, range over three runs):
+(branch-free, 1M keys, range over three runs of commit `d420208`):
 
 | Variant | Time |
 |---|---:|
@@ -161,9 +164,9 @@ already sorted or exactly reversed, where Utah Sort takes 4 ms.
 - One machine, one core. The headline is for `u32`. `u64` and `f64` give
   similar speedups, and strings don't
   ([Other key types](#other-key-types)).
-- Code layout matters. The 3.4× headline came from one build; the current
-  code gives about 3.1× on the same machine, with the same instructions in
-  the inner loop.
+- Code layout matters. Two builds with identical inner-loop instructions gave
+  3.4× and 3.1× for the headline, and some other cells have moved by up to a
+  third. Treat small differences between builds as noise.
 - Each algorithm uses the gap sequence its own literature recommends.
 - The standard library's sort is still about 3× faster than branch-free shaker
   sort. This matters only where you'd pick Shellsort anyway: tiny code, no
