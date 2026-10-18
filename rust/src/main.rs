@@ -1,19 +1,194 @@
 //! Shellsort vs. the Incerpi–Sedgewick (1987) shaker sort, plus the
-//! "Utah Sort" refinements, timed single-threaded on u32 keys.
+//! "Utah Sort" refinements, timed single-threaded.
 //!
-//!   cargo run --release                   main comparison
+//!   cargo run --release                   main comparison, u32 keys
+//!   cargo run --release -- --keys TYPE    same, TYPE = u32, u64, f64 or str
 //!   cargo run --release -- --ablate       which ingredient matters
 //!   cargo run --release -- --only NAME    one algorithm, 1M random keys, 10 runs
 //!                                         (for `perf stat`; NAME from --list)
 //!   cargo run --release -- --list         algorithm names
+//!
+//! `--keys` also applies to `--ablate` and `--only`.
 //!
 //! The published numbers were built with RUSTFLAGS="-C target-cpu=native".
 //! Add "-C no-vectorize-loops -C no-vectorize-slp" to rule out SIMD.
 //!
 //! No dependencies. Every result is checked against `sort_unstable`.
 
-use std::hint::black_box;
+use std::hint::{black_box, select_unpredictable};
 use std::time::Instant;
+
+// ---------------------------------------------------------------------------
+// Key types
+// ---------------------------------------------------------------------------
+
+/// What the sorts need from a key. Every algorithm is written once against
+/// this trait, and `--keys` picks the type.
+trait Key: Copy + PartialEq {
+    /// For the table header.
+    const NAME: &'static str;
+    /// Turns the u32 test patterns into keys, preserving order and equality,
+    /// so every key type sorts the same permutations.
+    fn from_u32s(xs: &[u32]) -> Vec<Self>;
+    /// `a > b`, used with a branch.
+    fn gt(a: Self, b: Self) -> bool;
+    /// Branch-free `(min, max, a > b)`.
+    fn min_max(a: Self, b: Self) -> (Self, Self, bool);
+    /// The reference sort, also timed as "std sort_unstable".
+    fn sort_std(v: &mut [Self]);
+    /// Output check.
+    fn same(a: &[Self], b: &[Self]) -> bool {
+        a == b
+    }
+}
+
+impl Key for u32 {
+    const NAME: &'static str = "u32";
+    fn from_u32s(xs: &[u32]) -> Vec<u32> {
+        xs.to_vec()
+    }
+    #[inline(always)]
+    fn gt(a: u32, b: u32) -> bool {
+        a > b
+    }
+    /// min/max compile to cmov (or SIMD).
+    #[inline(always)]
+    fn min_max(a: u32, b: u32) -> (u32, u32, bool) {
+        (a.min(b), a.max(b), a > b)
+    }
+    fn sort_std(v: &mut [u32]) {
+        v.sort_unstable();
+    }
+}
+
+impl Key for u64 {
+    const NAME: &'static str = "u64";
+    /// The pattern in the high half and a hash of it in the low half, so
+    /// random keys use all 64 bits.
+    fn from_u32s(xs: &[u32]) -> Vec<u64> {
+        xs.iter()
+            .map(|&x| (x as u64) << 32 | mix(x) as u64)
+            .collect()
+    }
+    #[inline(always)]
+    fn gt(a: u64, b: u64) -> bool {
+        a > b
+    }
+    #[inline(always)]
+    fn min_max(a: u64, b: u64) -> (u64, u64, bool) {
+        (a.min(b), a.max(b), a > b)
+    }
+    fn sort_std(v: &mut [u64]) {
+        v.sort_unstable();
+    }
+}
+
+/// Ordered by `f64::total_cmp`.
+impl Key for f64 {
+    const NAME: &'static str = "f64";
+    /// Values in about ±2.1e9 with a fractional part, so both signs occur.
+    /// 32 integer bits + 20 fraction bits fit in the mantissa exactly.
+    fn from_u32s(xs: &[u32]) -> Vec<f64> {
+        xs.iter()
+            .map(|&x| (x as f64 - 2_147_483_648.0) + (mix(x) >> 12) as f64 / 1_048_576.0)
+            .collect()
+    }
+    #[inline(always)]
+    fn gt(a: f64, b: f64) -> bool {
+        a.total_cmp(&b).is_gt()
+    }
+    /// Compares the integers that `total_cmp` compares and picks without a
+    /// branch (AVX-512 masked blends with target-cpu=native). That was faster
+    /// here than min/max on those integers and converting back.
+    /// `f64::min`/`max` would be wrong for NaN and for -0.0 vs 0.0.
+    #[inline(always)]
+    fn min_max(a: f64, b: f64) -> (f64, f64, bool) {
+        let gt = total_key(a) > total_key(b);
+        (
+            select_unpredictable(gt, b, a),
+            select_unpredictable(gt, a, b),
+            gt,
+        )
+    }
+    fn sort_std(v: &mut [f64]) {
+        v.sort_unstable_by(f64::total_cmp);
+    }
+    /// Bitwise, so -0.0 vs 0.0 or a NaN payload would count as wrong.
+    fn same(a: &[f64], b: &[f64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+}
+
+/// What `f64::total_cmp` compares: the bits as an i64, with the low 63 bits
+/// flipped for negative numbers.
+#[inline(always)]
+fn total_key(x: f64) -> i64 {
+    let b = x.to_bits() as i64;
+    b ^ (((b >> 63) as u64) >> 1) as i64
+}
+
+/// Byte strings of 8–24 bytes, compared by the standard `Ord for [u8]`
+/// (memcmp, then length). memcmp branches internally. The branch-free
+/// version only avoids branching on the result.
+impl Key for &'static [u8] {
+    const NAME: &'static str = "8–24-byte string";
+    /// x in base 26 as 7 letters, most significant first, which preserves
+    /// order, then 1–17 more letters that depend only on x, so equal x give
+    /// equal strings. All strings of one input share one leaked buffer.
+    fn from_u32s(xs: &[u32]) -> Vec<&'static [u8]> {
+        let mut buf = Vec::with_capacity(xs.len() * 17);
+        let mut ends = Vec::with_capacity(xs.len());
+        for &x in xs {
+            let start = buf.len();
+            buf.resize(start + 7, 0);
+            let mut y = x;
+            for c in buf[start..].iter_mut().rev() {
+                *c = b'a' + (y % 26) as u8;
+                y /= 26;
+            }
+            let mut h = mix(x ^ 0x9e37_79b9);
+            for _ in 0..=h % 17 {
+                h = mix(h);
+                buf.push(b'a' + (h % 26) as u8);
+            }
+            ends.push(buf.len());
+        }
+        let buf: &'static [u8] = buf.leak();
+        let mut start = 0;
+        ends.into_iter()
+            .map(|end| {
+                let s = &buf[start..end];
+                start = end;
+                s
+            })
+            .collect()
+    }
+    #[inline(always)]
+    fn gt(a: Self, b: Self) -> bool {
+        a > b
+    }
+    #[inline(always)]
+    fn min_max(a: Self, b: Self) -> (Self, Self, bool) {
+        let gt = a > b;
+        (
+            select_unpredictable(gt, b, a),
+            select_unpredictable(gt, a, b),
+            gt,
+        )
+    }
+    fn sort_std(v: &mut [Self]) {
+        v.sort_unstable();
+    }
+}
+
+/// Integer hash (Wellons' lowbias32), for key bits that don't affect order.
+fn mix(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^ (x >> 16)
+}
 
 // ---------------------------------------------------------------------------
 // Gap sequences
@@ -50,25 +225,25 @@ fn shaker_gaps(n: usize) -> Vec<usize> {
 
 /// Branchy compare-exchange.
 #[inline(always)]
-fn cx_branchy(v: &mut [u32], i: usize, j: usize) {
-    if v[i] > v[j] {
+fn cx_branchy<T: Key>(v: &mut [T], i: usize, j: usize) {
+    if T::gt(v[i], v[j]) {
         v.swap(i, j);
     }
 }
 
-/// Branch-free compare-exchange: min/max compile to cmov (or SIMD).
+/// Branch-free compare-exchange.
 #[inline(always)]
-fn cx(v: &mut [u32], i: usize, j: usize) {
-    let (a, b) = (v[i], v[j]);
-    v[i] = a.min(b);
-    v[j] = a.max(b);
+fn cx<T: Key>(v: &mut [T], i: usize, j: usize) {
+    let (lo, hi, _) = T::min_max(v[i], v[j]);
+    v[i] = lo;
+    v[j] = hi;
 }
 
-fn insertion_pass(v: &mut [u32], g: usize) {
+fn insertion_pass<T: Key>(v: &mut [T], g: usize) {
     for i in g..v.len() {
         let t = v[i];
         let mut j = i;
-        while j >= g && v[j - g] > t {
+        while j >= g && T::gt(v[j - g], t) {
             v[j] = v[j - g];
             j -= g;
         }
@@ -78,7 +253,7 @@ fn insertion_pass(v: &mut [u32], g: usize) {
 
 /// One h-shake: a left-to-right then a right-to-left pass.
 #[inline(always)]
-fn h_shake<const BRANCHLESS: bool>(v: &mut [u32], h: usize) {
+fn h_shake<T: Key, const BRANCHLESS: bool>(v: &mut [T], h: usize) {
     let n = v.len();
     for i in 0..n - h {
         if BRANCHLESS {
@@ -101,72 +276,72 @@ fn h_shake<const BRANCHLESS: bool>(v: &mut [u32], h: usize) {
 // ---------------------------------------------------------------------------
 
 /// Shellsort (Shell 1959) with Ciura's gaps.
-fn shellsort(v: &mut [u32]) {
+fn shellsort<T: Key>(v: &mut [T]) {
     for g in ciura_gaps(v.len()) {
         insertion_pass(v, g);
     }
 }
 
 /// Shaker sort (Incerpi & Sedgewick 1987), with ordinary branches.
-fn shaker(v: &mut [u32]) {
+fn shaker<T: Key>(v: &mut [T]) {
     for h in shaker_gaps(v.len()) {
-        h_shake::<false>(v, h);
+        h_shake::<T, false>(v, h);
     }
     insertion_pass(v, 1);
 }
 
 /// Shaker sort (Incerpi & Sedgewick 1987), branch-free.
-fn shaker_branchless(v: &mut [u32]) {
+fn shaker_branchless<T: Key>(v: &mut [T]) {
     for h in shaker_gaps(v.len()) {
-        h_shake::<true>(v, h);
+        h_shake::<T, true>(v, h);
     }
     insertion_pass(v, 1);
 }
 
 /// Shaker sort, branch-free, but with Ciura's gaps (isolates the gap choice).
-fn shaker_branchless_ciura(v: &mut [u32]) {
+fn shaker_branchless_ciura<T: Key>(v: &mut [T]) {
     for h in ciura_gaps(v.len()) {
-        h_shake::<true>(v, h);
+        h_shake::<T, true>(v, h);
     }
     insertion_pass(v, 1);
 }
 
 /// Branch-free h-shake followed by a full h-insertion at every gap
 /// (Utah Sort without the mirror pass or the window).
-fn shake_insert_every_gap(v: &mut [u32]) {
+fn shake_insert_every_gap<T: Key>(v: &mut [T]) {
     for g in ciura_gaps(v.len()) {
-        h_shake::<true>(v, g);
+        h_shake::<T, true>(v, g);
         insertion_pass(v, g);
     }
 }
 
 /// Same, with the 1987 gaps (completes the gaps x insertion-policy grid).
-fn shake_insert_every_gap_17(v: &mut [u32]) {
+fn shake_insert_every_gap_17<T: Key>(v: &mut [T]) {
     for g in shaker_gaps(v.len()) {
-        h_shake::<true>(v, g);
+        h_shake::<T, true>(v, g);
         insertion_pass(v, g);
     }
 }
 
 /// Utah Sort, line for line from the reference implementation (branchy).
-fn utah(v: &mut [u32]) {
-    utah_impl::<false, true>(v);
+fn utah<T: Key>(v: &mut [T]) {
+    utah_impl::<T, false, true>(v);
 }
 
 /// Utah Sort with branch-free passes.
-fn utah_branchless(v: &mut [u32]) {
-    utah_impl::<true, true>(v);
+fn utah_branchless<T: Key>(v: &mut [T]) {
+    utah_impl::<T, true, true>(v);
 }
 
 /// Utah Sort with branch-free passes and no mirror pass.
-fn utah_branchless_no_mirror(v: &mut [u32]) {
-    utah_impl::<true, false>(v);
+fn utah_branchless_no_mirror<T: Key>(v: &mut [T]) {
+    utah_impl::<T, true, false>(v);
 }
 
 /// Mirror pass, then per gap: forward pass (track the last swap R),
 /// backward pass over [0, R] (track the last swap L), then g-insertion over
 /// [L + 2g, R] with no bounds check.
-fn utah_impl<const BRANCHLESS: bool, const MIRROR: bool>(v: &mut [u32]) {
+fn utah_impl<T: Key, const BRANCHLESS: bool, const MIRROR: bool>(v: &mut [T]) {
     let n = v.len();
     if n < 2 {
         return;
@@ -187,10 +362,11 @@ fn utah_impl<const BRANCHLESS: bool, const MIRROR: bool>(v: &mut [u32]) {
         for i in 0..n - g {
             let (a, b) = (v[i], v[i + g]);
             if BRANCHLESS {
-                v[i] = a.min(b);
-                v[i + g] = a.max(b);
-                r = if a > b { i + g } else { r };
-            } else if a > b {
+                let (lo, hi, gt) = T::min_max(a, b);
+                v[i] = lo;
+                v[i + g] = hi;
+                r = if gt { i + g } else { r };
+            } else if T::gt(a, b) {
                 v.swap(i, i + g);
                 r = i + g;
             }
@@ -204,10 +380,11 @@ fn utah_impl<const BRANCHLESS: bool, const MIRROR: bool>(v: &mut [u32]) {
             for i in (0..=r - g).rev() {
                 let (a, b) = (v[i], v[i + g]);
                 if BRANCHLESS {
-                    v[i] = a.min(b);
-                    v[i + g] = a.max(b);
-                    l = if a > b { i } else { l };
-                } else if a > b {
+                    let (lo, hi, gt) = T::min_max(a, b);
+                    v[i] = lo;
+                    v[i + g] = hi;
+                    l = if gt { i } else { l };
+                } else if T::gt(a, b) {
                     v.swap(i, i + g);
                     l = i;
                 }
@@ -226,7 +403,7 @@ fn utah_impl<const BRANCHLESS: bool, const MIRROR: bool>(v: &mut [u32]) {
             // never goes below l. The Python version checks this on ~700k
             // inputs with a list that rejects negative indices.
             unsafe {
-                while *v.get_unchecked(j - g) > t {
+                while T::gt(*v.get_unchecked(j - g), t) {
                     *v.get_unchecked_mut(j) = *v.get_unchecked(j - g);
                     j -= g;
                 }
@@ -236,45 +413,47 @@ fn utah_impl<const BRANCHLESS: bool, const MIRROR: bool>(v: &mut [u32]) {
     }
 }
 
-fn std_sort_unstable(v: &mut [u32]) {
-    v.sort_unstable();
+fn std_sort_unstable<T: Key>(v: &mut [T]) {
+    T::sort_std(v);
 }
 
-type Algo = (&'static str, &'static str, fn(&mut [u32]));
+type Algo<T> = (&'static str, &'static str, fn(&mut [T]));
 
 /// (name for --only, column header, function)
-const ALGOS: &[Algo] = &[
-    ("shellsort", "Shellsort", shellsort),
-    ("shaker", "shaker 1987", shaker),
-    (
-        "shaker_branchless",
-        "shaker 1987, branch-free",
-        shaker_branchless,
-    ),
-    ("utah", "Utah", utah),
-    ("utah_branchless", "Utah, branch-free", utah_branchless),
-    ("std", "std sort_unstable", std_sort_unstable),
-    (
-        "utah_branchless_no_mirror",
-        "− mirror pass",
-        utah_branchless_no_mirror,
-    ),
-    (
-        "shake_insert_every_gap",
-        "shake+insert every gap, Ciura gaps",
-        shake_insert_every_gap,
-    ),
-    (
-        "shake_insert_every_gap_17",
-        "shake+insert every gap, 1.7^k gaps",
-        shake_insert_every_gap_17,
-    ),
-    (
-        "shaker_branchless_ciura",
-        "shake, insert at end, Ciura gaps",
-        shaker_branchless_ciura,
-    ),
-];
+fn algos<T: Key>() -> [Algo<T>; 10] {
+    [
+        ("shellsort", "Shellsort", shellsort),
+        ("shaker", "shaker 1987", shaker),
+        (
+            "shaker_branchless",
+            "shaker 1987, branch-free",
+            shaker_branchless,
+        ),
+        ("utah", "Utah", utah),
+        ("utah_branchless", "Utah, branch-free", utah_branchless),
+        ("std", "std sort_unstable", std_sort_unstable),
+        (
+            "utah_branchless_no_mirror",
+            "− mirror pass",
+            utah_branchless_no_mirror,
+        ),
+        (
+            "shake_insert_every_gap",
+            "shake+insert every gap, Ciura gaps",
+            shake_insert_every_gap,
+        ),
+        (
+            "shake_insert_every_gap_17",
+            "shake+insert every gap, 1.7^k gaps",
+            shake_insert_every_gap_17,
+        ),
+        (
+            "shaker_branchless_ciura",
+            "shake, insert at end, Ciura gaps",
+            shaker_branchless_ciura,
+        ),
+    ]
+}
 
 const MAIN: &[&str] = &[
     "shellsort",
@@ -318,6 +497,7 @@ const INPUTS: &[(&str, usize)] = &[
     ("sorted + 10 random at end", 1_000_000),
 ];
 
+/// The test pattern as u32s; `Key::from_u32s` turns it into keys.
 fn make_input(pattern: &str, n: usize, rng: &mut XorShift) -> Vec<u32> {
     let base: Vec<u32> = (0..n as u32).collect();
     match pattern {
@@ -347,22 +527,22 @@ fn make_input(pattern: &str, n: usize, rng: &mut XorShift) -> Vec<u32> {
 
 /// Best wall-clock time of `reps` runs, in milliseconds. Copies the input
 /// outside the timed region and checks every output.
-fn best_ms(f: fn(&mut [u32]), data: &[u32], expect: &[u32], reps: usize) -> f64 {
+fn best_ms<T: Key>(f: fn(&mut [T]), data: &[T], expect: &[T], reps: usize) -> f64 {
     let mut best = f64::INFINITY;
     for _ in 0..reps {
         let mut v = data.to_vec();
         let t = Instant::now();
         f(black_box(&mut v));
         let dt = t.elapsed().as_secs_f64() * 1e3;
-        assert!(v == expect, "wrong output");
+        assert!(T::same(&v, expect), "wrong output");
         best = best.min(dt);
     }
     best
 }
 
-fn lookup(name: &str) -> &'static Algo {
-    ALGOS
-        .iter()
+fn lookup<T: Key>(name: &str) -> Algo<T> {
+    algos::<T>()
+        .into_iter()
         .find(|a| a.0 == name)
         .unwrap_or_else(|| panic!("unknown algorithm {name}; try --list"))
 }
@@ -377,8 +557,8 @@ fn fmt_ms(ms: f64) -> String {
     }
 }
 
-fn table(names: &[&str]) {
-    let algos: Vec<&Algo> = names.iter().map(|n| lookup(n)).collect();
+fn table<T: Key>(names: &[&str]) {
+    let algos: Vec<Algo<T>> = names.iter().map(|n| lookup(n)).collect();
     let mut rng = XorShift(0x2323_2323_2323_2323);
 
     print!("| input | n |");
@@ -392,9 +572,9 @@ fn table(names: &[&str]) {
     println!();
 
     for &(pattern, n) in INPUTS {
-        let data = make_input(pattern, n, &mut rng);
+        let data = T::from_u32s(&make_input(pattern, n, &mut rng));
         let mut expect = data.clone();
-        expect.sort_unstable();
+        T::sort_std(&mut expect);
         let reps = if n >= 10_000_000 { 3 } else { 5 };
         print!("| {pattern} | {n} |");
         for a in &algos {
@@ -404,36 +584,59 @@ fn table(names: &[&str]) {
     }
 }
 
+fn run<T: Key>(args: &[String]) {
+    if let Some(i) = args.iter().position(|a| a == "--only") {
+        let a = lookup::<T>(args.get(i + 1).expect("--only needs a name"));
+        let mut rng = XorShift(0x2323_2323_2323_2323);
+        let data = T::from_u32s(&make_input("random", 1_000_000, &mut rng));
+        let mut expect = data.clone();
+        T::sort_std(&mut expect);
+        let ms = best_ms(a.2, &data, &expect, 10);
+        println!(
+            "{}: best of 10 = {} ms (1M random {} keys)",
+            a.0,
+            fmt_ms(ms),
+            T::NAME
+        );
+        return;
+    }
+
+    println!(
+        "Times in ms, best of 5 (3 at n = 10M), single-threaded, {} keys. \
+         avx2={} avx512f={}\n",
+        T::NAME,
+        cfg!(target_feature = "avx2"),
+        cfg!(target_feature = "avx512f")
+    );
+    if args.iter().any(|a| a == "--ablate") {
+        table::<T>(ABLATE);
+    } else {
+        table::<T>(MAIN);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--list") {
-        for a in ALGOS {
+        for a in algos::<u32>() {
             println!("{:<28} {}", a.0, a.1);
         }
         return;
     }
 
-    if let Some(i) = args.iter().position(|a| a == "--only") {
-        let a = lookup(args.get(i + 1).expect("--only needs a name"));
-        let mut rng = XorShift(0x2323_2323_2323_2323);
-        let data = make_input("random", 1_000_000, &mut rng);
-        let mut expect = data.clone();
-        expect.sort_unstable();
-        let ms = best_ms(a.2, &data, &expect, 10);
-        println!("{}: best of 10 = {} ms (1M random u32)", a.0, fmt_ms(ms));
-        return;
-    }
-
-    println!(
-        "Times in ms, best of 5 (3 at n = 10M), single-threaded, u32 keys. \
-         avx2={} avx512f={}\n",
-        cfg!(target_feature = "avx2"),
-        cfg!(target_feature = "avx512f")
-    );
-    if args.iter().any(|a| a == "--ablate") {
-        table(ABLATE);
-    } else {
-        table(MAIN);
+    let keys = match args.iter().position(|a| a == "--keys") {
+        Some(i) => args
+            .get(i + 1)
+            .map(String::as_str)
+            .expect("--keys needs u32, u64, f64 or str"),
+        None => "u32",
+    };
+    match keys {
+        "u32" => run::<u32>(&args),
+        "u64" => run::<u64>(&args),
+        "f64" => run::<f64>(&args),
+        "str" => run::<&'static [u8]>(&args),
+        _ => panic!("unknown key type {keys}; use u32, u64, f64 or str"),
     }
 }

@@ -24,12 +24,25 @@ Run on 2026-10-17.
 | `main.md` | `cargo run --release` |
 | `main-no-simd.md` | same, with `-C no-vectorize-loops -C no-vectorize-slp` added to `RUSTFLAGS` |
 | `ablate-run1.md` … `ablate-run3.md` | `cargo run --release -- --ablate`, three separate runs |
+| `main-u32.md` | `cargo run --release -- --keys u32`, after the benchmark was made generic over the key type |
+| `main-u64.md` | `cargo run --release -- --keys u64` |
+| `main-f64.md` | `cargo run --release -- --keys f64` |
+| `main-str.md` | `cargo run --release -- --keys str` (8–24-byte strings) |
 
 The three ablation runs agree to within about 2%. Separate builds of the same
 code have differed by up to about 10% on some variants.
 
+`main.md`, `main-no-simd.md` and the ablation runs come from commit
+`d420208`, before the benchmark took `--keys`. The four `main-<type>.md`
+files come from the current code and one build. `main-u32.md` differs from
+`main.md` in some cells by up to about a third in either direction, for
+example 26.6 vs 24.3 ms for branch-free shaker sort at 1M, although that
+loop compiles to the same instructions. See
+[Other key types](../docs/details.md#other-key-types).
+
 ## Adding your machine
 
 Make a folder named after your CPU with `main.md`, `ablate-run1.md` and, if you
-can, `main-no-simd.md`. Add a short table like the one above, then open a pull
-request. An issue with the raw output works too.
+can, `main-no-simd.md` and `main-<type>.md` for `--keys u64`, `f64` and `str`.
+Add a short table like the one above, then open a pull request. An issue with
+the raw output works too.

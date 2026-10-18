@@ -88,6 +88,38 @@ perf stat -e branches,branch-misses ./target/release/utah_bench --only shaker_br
 Each `--only` run sorts 1M random keys 10 times. The counts also include
 generating the input and one reference sort, which are the same for both.
 
+## Other key types
+
+The headline is for `u32`. `cargo run --release -- --keys u64` (or `f64`,
+`str`) runs the same table with other keys, built from the same input
+patterns. 1M random keys, all from one build:
+
+| Keys | Shellsort | shaker, with a branch | shaker, branch-free | branch-free vs. Shellsort |
+|---|---:|---:|---:|---:|
+| `u32` | 81 ms | 81 ms | 27 ms | 3.1× faster |
+| `u64` | 82 ms | 83 ms | 25 ms | 3.3× faster |
+| `f64`, `total_cmp` order | 123 ms | 100 ms | 44 ms | 2.8× faster |
+| 8–24-byte strings (`&[u8]`) | 338 ms | 448 ms | 405 ms | 1.2× **slower** |
+
+- **`u64`: the result holds.** 3.3× at 1M keys, 3.4× at 10M.
+- **`f64`: it shrinks** to 2.8× at 1M (3.0× at 10M). Both sorts compare with
+  `total_cmp`, which turns each float into an integer before comparing. That
+  slows both down, and branch-free shaker sort still wins clearly.
+- **Strings: it disappears.** Shellsort is 1.2× faster at 1M and 1.6× faster
+  at 10M. Each comparison is a `memcmp` call through two pointers, and that,
+  not the branch, is most of the cost: removing the branch saves only 10% at
+  1M (448 → 405 ms). Shaker sort makes 1.6× as many comparisons (at 100k
+  keys), so it loses. At 10M it is even slower than shaker sort with a
+  branch (12.6 s vs 10.4 s), probably because the branch lets the CPU start
+  the next loads before the comparison finishes.
+
+The `u32` row is slower than the headline (27 vs 24 ms), although the inner
+loop compiles to the same instructions. The headline numbers come from the
+previous commit (`d420208`). With loops forced to 64-byte alignment, that
+build and the current one both take 26.4 ms, so 24 ms was a lucky code
+layout. Building the current code gives about 3.1× for `u32`, not 3.4×. More
+in [`docs/details.md`](docs/details.md#other-key-types).
+
 ## What about Utah Sort?
 
 An AI tool proposed "Utah Sort" as a new algorithm and presented its pieces
@@ -126,7 +158,12 @@ already sorted or exactly reversed, where Utah Sort takes 4 ms.
 
 ## Caveats
 
-- One machine, one key type (`u32`), one core.
+- One machine, one core. The headline is for `u32`. `u64` and `f64` give
+  similar speedups, and strings don't
+  ([Other key types](#other-key-types)).
+- Code layout matters. The 3.4× headline came from one build; the current
+  code gives about 3.1× on the same machine, with the same instructions in
+  the inner loop.
 - Each algorithm uses the gap sequence its own literature recommends.
 - The standard library's sort is still about 3× faster than branch-free shaker
   sort. This matters only where you'd pick Shellsort anyway: tiny code, no
@@ -139,14 +176,15 @@ already sorted or exactly reversed, where Utah Sort takes 4 ms.
 
 ## Run it
 
-Rust (stable, no dependencies):
+Rust (stable, 1.88 or newer, no dependencies):
 
 ```sh
 cd rust
 export RUSTFLAGS="-C target-cpu=native"
-cargo run --release              # main table, about a minute
-cargo run --release -- --ablate  # Utah Sort ablation, about two minutes
-cargo run --release -- --list    # algorithm names for --only
+cargo run --release                # main table, about a minute
+cargo run --release -- --keys f64  # same with u64, f64 or str keys (default u32)
+cargo run --release -- --ablate    # Utah Sort ablation, about two minutes
+cargo run --release -- --list      # algorithm names for --only
 ```
 
 On Windows PowerShell, use `$env:RUSTFLAGS="-C target-cpu=native"` instead
@@ -164,7 +202,8 @@ python count_comparisons.py
 
 - **Other machines.** Intel, Apple Silicon and other ARM chips, older x86, a
   Raspberry Pi, a microcontroller. Open an issue with your CPU model and the
-  output of the main table and `--ablate`.
+  output of the main table and `--ablate`, and if you can, `--keys u64`,
+  `f64` and `str`.
 - **`perf stat` numbers** for the two commands above.
 - **Prior art** for the branch-free result.
 

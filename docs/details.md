@@ -162,9 +162,83 @@ Utah Sort faster, not slower. Two conclusions hold in every build:
   pass takes most of the time. With 1.7^k gaps it has almost nothing left to
   do.
 
+## Other key types
+
+`cargo run --release -- --keys u64` (or `f64`, `str`) runs the main table
+with other keys. Every key type is built from the same u32 patterns by a map
+that keeps order and equality, so all four sort the same permutations with
+the same duplicates, and each of the benchmark's own sorts makes the same
+comparisons whatever the key type.
+
+- **`u64`**: the u32 value in the high half and a hash of it in the low half,
+  so random keys use all 64 bits.
+- **`f64`**: values in about ±2.1 × 10⁹ with 20 fraction bits, both signs, no
+  NaN. Every algorithm and the reference sort order them by `f64::total_cmp`.
+  The branch-free compare-exchange compares the same integers `total_cmp`
+  compares (the bits as an `i64`, with the low 63 bits flipped for negative
+  numbers) and picks the two values without a branch (in this build, AVX-512
+  compares and masked blends). `f64::min`/`max` would be cheaper but wrong
+  for NaN, and for −0.0 vs 0.0 can return the same zero twice.
+- **`str`**: `&[u8]` slices of 8–24 lowercase letters in one buffer: 7 base-26
+  letters that encode the u32 value, then 1–17 letters that depend only on it.
+  They are compared with Rust's standard `Ord for [u8]` (a `memcmp` call, then
+  the lengths). The branch-free version picks pointer and length with `cmov`
+  on the result, but `memcmp` itself still branches.
+
+Random input, in ms, all from one build
+([`main-u32.md`](../results/ryzen-9-9950x3d/main-u32.md),
+[`main-u64.md`](../results/ryzen-9-9950x3d/main-u64.md),
+[`main-f64.md`](../results/ryzen-9-9950x3d/main-f64.md),
+[`main-str.md`](../results/ryzen-9-9950x3d/main-str.md)):
+
+| Keys, n | Shellsort | shaker 1987 | shaker 1987, branch-free | Shellsort ÷ branch-free | `sort_unstable` |
+|---|---:|---:|---:|---:|---:|
+| u32, 1M | 81.4 | 81.4 | 26.6 | 3.1 | 9.40 |
+| u32, 10M | 1005 | 984 | 318 | 3.2 | 109 |
+| u64, 1M | 82.3 | 82.5 | 24.6 | 3.3 | 9.28 |
+| u64, 10M | 1021 | 1003 | 304 | 3.4 | 110 |
+| f64, 1M | 123 | 100 | 43.5 | 2.8 | 12.7 |
+| f64, 10M | 1509 | 1228 | 497 | 3.0 | 146 |
+| string, 1M | 338 | 448 | 405 | 0.83 | 122 |
+| string, 10M | 7902 | 10,408 | 12,561 | 0.63 | 1839 |
+
+1. **`u64`: the result holds.** The times are within the build-to-build
+   variation of `u32` (see below).
+2. **`f64`: it shrinks to about 3×.** `total_cmp` puts a few integer
+   operations in front of every comparison, which slows Shellsort down by
+   about 1.5× and branch-free shaker sort by 1.6–1.8× compared with `u64`.
+   The other patterns look like `u32`: branch-free shaker sort takes about
+   43 ms on every 1M input.
+3. **Strings: it disappears.** Shellsort beats shaker sort, with or without
+   branches, on every input pattern. On random input, branch-free shaker sort
+   is 1.2× slower at 1M and 1.6× slower at 10M. A comparison is now a
+   `memcmp` call through two pointers, and that, not the branch, is most of
+   the cost: removing the branch saves only 10% at 1M (448 → 405 ms). Shaker
+   sort makes 1.6× as many comparisons (at n = 100k), so it loses. At 10M the
+   strings take about 160 MB, plus 160 MB for the slices being sorted, more
+   than the L3 cache. There the branch-free version is slower than shaker
+   sort with a branch (12.6 s vs 10.4 s). A likely reason
+   is that with a branch the CPU keeps going on its guess and starts the next
+   loads early, while with `cmov` each compare-exchange waits for the one
+   before it. I haven't checked this with counters.
+
+**The u32 row is slower than in `main.md`** (26.6 vs 24.3 ms branch-free at
+1M). `main.md` came from the previous commit (`d420208`). Running that build
+again right after these runs reproduced it (24.7 ms), so it isn't the
+machine. The inner loop of branch-free shaker sort compiles to the same
+instructions in both builds, apart from register names. Built with
+`-C llvm-args=-align-loops=64`, both commits take 26.4 ms
+(`--only shaker_branchless`), so for that loop the difference is where it
+lands in memory, and 24 ms was the lucky layout. The current code gives about
+3.1× for u32. Other cells moved between the two builds too, by up to about a
+third in either direction: `sort_unstable` 7.9 → 9.4 ms, Shellsort on sorted
+input 8.3 → 5.6 ms, branch-free Utah Sort on sorted input 8.5 → 11.5 ms. I
+only tested the alignment explanation on branch-free shaker sort.
+
 ## Limitations
 
-- One machine, one key type, single-threaded.
+- One machine, single-threaded. Four key types, and only one kind of string
+  (random lowercase letters, 8–24 bytes).
 - No hardware performance counters yet, so the branch-misprediction
   explanation is a hypothesis.
 - Gap sequences are the ones recommended in each algorithm's literature, not
